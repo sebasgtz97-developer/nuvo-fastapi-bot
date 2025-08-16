@@ -2,7 +2,7 @@ import os
 import re
 import pandas as pd
 from fastapi import FastAPI, Request
-from fastapi.responses import Response
+from fastapi.responses import PlainTextResponse
 from dotenv import load_dotenv
 from xml.sax.saxutils import escape
 
@@ -124,13 +124,11 @@ def format_reply_from_result(result):
     return str(result)
 
 
-def twiml_response(body_text: str) -> Response:
+def twiml_response(body_text: str) -> PlainTextResponse:
     safe_text = escape(body_text or "")
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Message>{safe_text}</Message>
-</Response>"""
-    return Response(content=xml, media_type="application/xml")
+<Response><Message>{safe_text}</Message></Response>"""
+    return PlainTextResponse(content=xml, media_type="text/xml; charset=utf-8")
 
 
 # ---------- Utility Routes ----------
@@ -164,42 +162,32 @@ def ask_gsheet(q: str):
         return {"error": str(e)}
 
 
-@app.post("/whatsapp", summary="Whatsapp Webhook")
+@app.post("/whatsapp")
 async def whatsapp_webhook(request: Request):
     form = await request.form()
-    message_body = form.get("Body", "")
-    print("📩 Mensaje recibido (WhatsApp):", message_body)
+    message_body = (form.get("Body") or "").strip()
 
-    df = load_data()
-    print("📄 Columnas del DataFrame:", df.columns.tolist())
+    # quick default reply (guarantees a fast response)
+    reply = "Recibido ✅"
 
-    reply = "No encontré información con ese criterio."
     try:
-        raw_code = interpret_query(message_body, df)
-        code = extract_code(raw_code)
-        print("🧠 Código generado (WhatsApp):", raw_code, "=>", code)
-
-        result = safe_eval_df_expr(code, df)
-        print("📦 Resultado eval (WhatsApp):", result)
-
-        reply = format_reply_from_result(result)
-        reply = (reply or "").strip()
-
-        if reply == "" or reply.startswith("No encontré"):
-            print("🔁 Fallback manual activado...")
-            alt_result = fallback_carrier_lookup(message_body, df)
-            if alt_result is not None:
-                reply = (format_reply_from_result(alt_result) or "").strip()
-
-    except Exception as e:
-        print("❌ Error en procesamiento primario:", e)
-        alt_result = fallback_carrier_lookup(message_body, df)
-        if alt_result is not None:
-            reply = (format_reply_from_result(alt_result) or "").strip()
+        df = load_data()
+        direct = direct_lookup(message_body, df)  # optional helper you can add
+        if direct:
+            reply = f"📄 Carrier name: {direct}"
         else:
-            reply = f"Error: {str(e)}"
+            raw_code = interpret_query(message_body, df)
+            code = extract_code(raw_code)
+            result = safe_eval_df_expr(code, df)
+            reply = (format_reply_from_result(result) or "").strip() or reply
 
-    print("📤 Twilio response preview:\n", twiml_response(reply).body.decode())
+            if reply.startswith("No encontré"):
+                alt = fallback_carrier_lookup(message_body, df)
+                if alt is not None:
+                    reply = (format_reply_from_result(alt) or "").strip() or reply
+    except Exception as e:
+        print("webhook error:", e)
+
     return twiml_response(reply)
 
 
