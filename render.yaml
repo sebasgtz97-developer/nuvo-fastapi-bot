@@ -1,5 +1,4 @@
 services:
-  # --- FastAPI web service (free plan) ---
   - type: web
     name: nuvo-fastapi-bot
     runtime: python
@@ -22,26 +21,4 @@ services:
       - key: ENV
         value: production
 
-  # --- Cron job every 2 hours ---
-  - type: cron
-    name: send-status-updates-every-2h
-    runtime: python
-    schedule: "0 */2 * * *"
-    buildCommand: pip install -r requirements.txt
-    startCommand: python send_updates.py
-    envVars:
-      - key: OPENAI_API_KEY
-        sync: false
-      - key: TWILIO_ACCOUNT_SID
-        sync: false
-      - key: TWILIO_AUTH_TOKEN
-        sync: false
-      - key: TWILIO_WHATSAPP_FROM
-        sync: false
-      - key: WHATSAPP_GROUP_SID
-        sync: false
-      - key: SHEET_URL
-        sync: false
-      - key: ENV
-        value: production
 
