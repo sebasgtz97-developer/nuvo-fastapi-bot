@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+gunicorn
+python-dotenv
+pandas
+httpx
+twilio
+openai
+gspread
+google-auth
+google-auth-oauthlib
+oauth2client
+
+
