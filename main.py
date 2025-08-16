@@ -1,6 +1,8 @@
 import os
 import re
 import pandas as pd
+import asyncio
+from starlette.concurrency import run_in_threadpool
 from time import time
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
@@ -182,7 +184,7 @@ def format_reply_from_result(result):
 def twiml_response(body_text: str) -> PlainTextResponse:
     safe_text = escape(body_text or "")
     xml = f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{safe_text}</Message></Response>'
-    return PlainTextResponse(content=xml, media_type="text/xml; charset=utf-8")
+    return PlainTextResponse(content=xml, media_type="application/xml; charset=utf-8")
 
 
 # ---------- Utility Routes ----------
@@ -216,32 +218,44 @@ def ask_gsheet(q: str):
 
 @app.post("/whatsapp", summary="Whatsapp Webhook")
 async def whatsapp_webhook(request: Request):
+    # Twilio sends x-www-form-urlencoded; requires python-multipart in requirements
     form = await request.form()
     message_body = (form.get("Body") or "").strip()
 
-    # quick default reply so Twilio always gets something fast
+    # Always have something quick to send back
     reply = "Recibido ✅"
 
     try:
-        df = get_df()
+        df = get_df()  # cached; first call may still be a few seconds
 
-        # 1) deterministic lookup first
+        # 1) Fast deterministic lookup (cheap)
         direct = direct_lookup(message_body, df)
         if direct:
             reply = f"📄 Carrier name: {direct}"
-        else:
-            # 2) LLM route
-            raw_code = interpret_query(message_body, df)
+            return twiml_response(reply)
+
+        # 2) Cheap heuristic fallback (also fast)
+        alt = fallback_carrier_lookup(message_body, df)
+        if alt is not None and not isinstance(alt, pd.Series) or (isinstance(alt, pd.Series) and not alt.empty):
+            reply = (format_reply_from_result(alt) or "").strip() or reply
+            return twiml_response(reply)
+
+        # 3) LLM route with a hard timeout budget
+        async def llm_flow():
+            raw_code = await run_in_threadpool(interpret_query, message_body, df)
             code = extract_code(raw_code)
             print("🧠 Código generado (WhatsApp):", raw_code, "=>", code)
-            result = safe_eval_df_expr(code, df)
-            reply = (format_reply_from_result(result) or "").strip() or reply
+            result = await run_in_threadpool(safe_eval_df_expr, code, df)
+            return (format_reply_from_result(result) or "").strip()
 
-            # 3) final fallback heuristic
-            if reply.startswith("No encontré"):
-                alt = fallback_carrier_lookup(message_body, df)
-                if alt is not None:
-                    reply = (format_reply_from_result(alt) or "").strip() or reply
+        try:
+            # keep it under Twilio’s ~10s window; leave buffer for network
+            llm_reply = await asyncio.wait_for(llm_flow(), timeout=7.0)
+            if llm_reply:
+                reply = llm_reply
+        except asyncio.TimeoutError:
+            # Too slow—fall back to a helpful, immediate answer
+            reply = "Estoy consultando datos y puede tardar. Intenta con: “Quién cubrió el shipment id 63357?” o envía exacto el ID (por ejemplo: SH-63357)."
 
     except Exception as e:
         print("webhook error:", e)
