@@ -1,0 +1,18 @@
+# Never commit secrets
+.env
+.env.*
+.secret/
+
+# Python caches
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+
+# OS files
+.DS_Store
+Thumbs.db
