@@ -1,6 +1,7 @@
 import os
 import re
 import pandas as pd
+from time import time
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
 from dotenv import load_dotenv
@@ -13,9 +14,21 @@ load_dotenv()  # loads env vars; DO NOT print secrets
 
 app = FastAPI(title="nuvo-fastapi-bot", version="1.0.0")
 
+# ---------- Simple cache for the Google Sheet ----------
+_SHEET_CACHE = {"df": None, "ts": 0.0}
+_CACHE_TTL = 300  # seconds
+
+def get_df():
+    now = time()
+    if _SHEET_CACHE["df"] is not None and now - _SHEET_CACHE["ts"] < _CACHE_TTL:
+        return _SHEET_CACHE["df"]
+    df = load_data()
+    _SHEET_CACHE["df"] = df
+    _SHEET_CACHE["ts"] = now
+    return df
+
 # ---------- Helpers ----------
 
-# More tolerant extractor for messy LLM outputs
 def extract_code(raw: str) -> str:
     """
     Pull a pandas expression on df from an LLM response.
@@ -106,7 +119,7 @@ def fallback_carrier_lookup(message: str, df: pd.DataFrame):
     return None
 
 
-# NEW: deterministic mini-QL for "shipment id 12345"
+# Deterministic mini-QL for "shipment id 12345"
 SHIP_ID_RE = re.compile(r"(?:shipment\s*id|shipment\s*|sh-?)\s*[:#]?\s*(\d{3,})", re.I)
 
 def direct_lookup(message: str, df: pd.DataFrame):
@@ -181,12 +194,6 @@ def root():
 def healthz():
     return {"ok": True}
 
-@app.get("/send-updates", summary="Manual Send Updates")
-def manual_send_updates():
-    from send_updates import main as run_updates
-    run_updates()
-    return {"status": "updates sent"}
-
 # Minimal TwiML echo to validate Twilio pipeline quickly
 @app.post("/twilio/test")
 def twilio_test():
@@ -196,7 +203,7 @@ def twilio_test():
 # ---------- Business Routes ----------
 @app.get("/ask", summary="Ask Gsheet")
 def ask_gsheet(q: str):
-    df = load_data()
+    df = get_df()
     try:
         raw_code = interpret_query(q, df)
         code = extract_code(raw_code)
@@ -216,7 +223,7 @@ async def whatsapp_webhook(request: Request):
     reply = "Recibido ✅"
 
     try:
-        df = load_data()
+        df = get_df()
 
         # 1) deterministic lookup first
         direct = direct_lookup(message_body, df)
@@ -240,6 +247,7 @@ async def whatsapp_webhook(request: Request):
         print("webhook error:", e)
 
     return twiml_response(reply)
+
 
 
 
