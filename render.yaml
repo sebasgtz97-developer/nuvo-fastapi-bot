@@ -1,0 +1,50 @@
+services:
+  # --- FastAPI web service (free plan) ---
+  - type: web
+    name: nuvo-fastapi-bot
+    runtime: python
+    plan: free
+    repo: .
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -k uvicorn.workers.UvicornWorker -w 2 -b 0.0.0.0:$PORT main:app
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_WHATSAPP_FROM
+        sync: false
+      - key: WHATSAPP_GROUP_SID
+        sync: false
+      - key: SHEET_URL
+        sync: false
+      - key: ENV
+        value: production
+
+  # --- Cron job that runs every 2 hours ---
+  - type: cron
+    name: send-status-updates-every-2h
+    runtime: python
+    # NOTE: cron jobs have a $1/month minimum; omit "plan" to use the default instance type.
+    # You can explicitly choose a plan (e.g., starter), but leaving it out uses the default.
+    schedule: "0 */2 * * *"
+    repo: .
+    buildCommand: pip install -r requirements.txt
+    startCommand: python send_updates.py
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_WHATSAPP_FROM
+        sync: false
+      - key: WHATSAPP_GROUP_SID
+        sync: false
+      - key: SHEET_URL
+        sync: false
+      - key: ENV
+        value: production
