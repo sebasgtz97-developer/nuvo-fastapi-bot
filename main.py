@@ -9,36 +9,29 @@ from xml.sax.saxutils import escape
 from openai_agent import interpret_query
 from gsheet import load_data
 
-load_dotenv()
-print("🔐 API KEY (debug):", os.getenv("OPENAI_API_KEY"))  # DEBUG — quita en prod
+load_dotenv()  # loads env vars; do NOT print secrets
 
-app = FastAPI()
+app = FastAPI(title="nuvo-fastapi-bot", version="1.0.0")
 
 # ---------- Helpers ----------
 def extract_code(raw: str) -> str:
     if not raw:
         return ""
-
     code_blocks = re.findall(r"```(?:python)?\s*([^`]+)```", raw, flags=re.IGNORECASE)
     if code_blocks:
         candidate = code_blocks[0].strip()
         lines = [l.strip() for l in candidate.splitlines()]
-        # Encuentra la primera línea que contenga 'df['
         for line in reversed(lines):
             if 'df[' in line or '.sum()' in line or '.mean()' in line or '.count()' in line:
                 if "=" in line:
-                    # Elimina parte izquierda del igual
                     return line.split("=", 1)[1].strip()
                 return line.strip()
         return candidate
-
-    # Fallback por si no vino en bloque
     for line in raw.splitlines():
         if 'df[' in line:
             if '=' in line:
                 return line.split('=', 1)[1].strip()
             return line.strip()
-
     return raw.strip()
 
 
@@ -49,47 +42,35 @@ def safe_eval_df_expr(code: str, df: pd.DataFrame):
     import builtins
 
     try:
-        # Convertir fechas
+        # Convertir fechas si existen
         date_cols = ["CREATED_AT_MX", "PICKUP_STARTS_AT", "INVOICED_AT", "ACTUAL_DELIVERED_TO_DESTINATION_"]
         for col in date_cols:
             if col in df.columns:
                 df[col] = pd.to_datetime(df[col], errors="coerce")
 
-        # Convertir números
+        # Convertir números si existen
         money_cols = ["GROSS_PROFIT", "TOTAL_COST", "TOTAL_REVENUE", "FREIGHT_COST", "FREIGHT_REVENUE"]
         for col in money_cols:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        local_vars = {
-            "df": df,
-            "pd": pd,
-            "datetime": datetime
-        }
+        local_vars = {"df": df, "pd": pd, "datetime": datetime}
 
-        # Si el código tiene saltos de línea, usa exec
         if "\n" in code or ";" in code:
             with contextlib.redirect_stdout(io.StringIO()):
                 exec(code, {"__builtins__": builtins.__dict__}, local_vars)
-
-            # Devolver la última variable definida que sea resultado
             for var_name in reversed(list(local_vars.keys())):
                 if isinstance(local_vars[var_name], (int, float, str, pd.Series, pd.DataFrame)):
                     return local_vars[var_name]
-
-        # Si es una sola expresión
         return eval(code, {"__builtins__": builtins.__dict__}, local_vars)
-
     except Exception as e:
         raise RuntimeError(f"Eval error: {e} | code={code}")
-
 
 
 def fallback_carrier_lookup(message: str, df: pd.DataFrame):
     match = re.search(r"(SH-)?(\d{3,})", message.upper())
     if not match:
         return None
-
     ship_id = match.group(2)
 
     if "SHIPMENT_ID" in df.columns:
@@ -102,8 +83,8 @@ def fallback_carrier_lookup(message: str, df: pd.DataFrame):
         res = df.loc[df["SHIPMENT_NAME"].astype(str).str.strip().str.upper() == alt, "CARRIER_NAME"]
         if not res.empty:
             return res
-
     return None
+
 
 def format_reply_from_result(result):
     def is_money_column(col_name):
@@ -120,13 +101,10 @@ def format_reply_from_result(result):
     if isinstance(result, pd.Series):
         if result.empty:
             return "No encontré información con ese criterio."
-
         key = result.name
         val = result.iloc[0]
-
         if is_money_column(key):
             val = format_money(val)
-
         key = key.replace("_", " ").capitalize()
         return f"📄 {key}: {val}"
 
@@ -145,6 +123,7 @@ def format_reply_from_result(result):
 
     return str(result)
 
+
 def twiml_response(body_text: str) -> Response:
     safe_text = escape(body_text or "")
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -153,8 +132,26 @@ def twiml_response(body_text: str) -> Response:
 </Response>"""
     return Response(content=xml, media_type="application/xml")
 
-# ---------- Routes ----------
-@app.get("/ask")
+
+# ---------- Utility Routes ----------
+@app.get("/")
+def root():
+    return {"service": "nuvo-fastapi-bot", "status": "running"}
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+@app.get("/send-updates")
+def manual_send_updates():
+    # calls the same logic your cron used to run
+    from send_updates import main as run_updates
+    run_updates()
+    return {"status": "updates sent"}
+
+
+# ---------- Business Routes ----------
+@app.get("/ask", summary="Ask Gsheet")
 def ask_gsheet(q: str):
     df = load_data()
     try:
@@ -166,7 +163,8 @@ def ask_gsheet(q: str):
     except Exception as e:
         return {"error": str(e)}
 
-@app.post("/whatsapp")
+
+@app.post("/whatsapp", summary="Whatsapp Webhook")
 async def whatsapp_webhook(request: Request):
     form = await request.form()
     message_body = form.get("Body", "")
@@ -176,7 +174,6 @@ async def whatsapp_webhook(request: Request):
     print("📄 Columnas del DataFrame:", df.columns.tolist())
 
     reply = "No encontré información con ese criterio."
-
     try:
         raw_code = interpret_query(message_body, df)
         code = extract_code(raw_code)
@@ -186,33 +183,25 @@ async def whatsapp_webhook(request: Request):
         print("📦 Resultado eval (WhatsApp):", result)
 
         reply = format_reply_from_result(result)
-
-        if reply is None:
-            reply = ""
-        reply = str(reply).strip()
+        reply = (reply or "").strip()
 
         if reply == "" or reply.startswith("No encontré"):
             print("🔁 Fallback manual activado...")
             alt_result = fallback_carrier_lookup(message_body, df)
             if alt_result is not None:
-                reply = format_reply_from_result(alt_result)
-                if reply is None:
-                    reply = ""
-                reply = str(reply).strip()
+                reply = (format_reply_from_result(alt_result) or "").strip()
 
     except Exception as e:
         print("❌ Error en procesamiento primario:", e)
         alt_result = fallback_carrier_lookup(message_body, df)
         if alt_result is not None:
-            reply = format_reply_from_result(alt_result)
-            if reply is None:
-                reply = ""
-            reply = str(reply).strip()
+            reply = (format_reply_from_result(alt_result) or "").strip()
         else:
             reply = f"Error: {str(e)}"
 
     print("📤 Twilio response preview:\n", twiml_response(reply).body.decode())
     return twiml_response(reply)
+
 
 
 
