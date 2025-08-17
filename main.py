@@ -9,7 +9,8 @@ from fastapi.responses import PlainTextResponse
 from dotenv import load_dotenv
 from xml.sax.saxutils import escape
 
-# ⬇️ Nuevo: importamos NLU + formateo humano
+# Resolver de columnas y NLU / formateo humano
+from openai_agent import build_column_resolver, col
 from openai_agent import interpret_intent, format_answer
 
 from gsheet import load_data
@@ -27,6 +28,11 @@ def get_df():
     if _SHEET_CACHE["df"] is not None and now - _SHEET_CACHE["ts"] < _CACHE_TTL:
         return _SHEET_CACHE["df"]
     df = load_data()
+    # Construir resolver de sinónimos una vez por carga
+    try:
+        df.__colresolver__ = build_column_resolver(df)
+    except Exception:
+        df.__colresolver__ = {}
     _SHEET_CACHE["df"] = df
     _SHEET_CACHE["ts"] = now
     return df
@@ -82,14 +88,18 @@ def fallback_carrier_lookup(message: str, df: pd.DataFrame):
         return None
     ship_id = match.group(2)
 
-    if "SHIPMENT_ID" in df.columns:
-        res = df.loc[df["SHIPMENT_ID"].astype(str).str.strip() == ship_id, "CARRIER_NAME"]
+    id_col = col(df, getattr(df, "__colresolver__", {}), "SHIPMENT_ID") or "SHIPMENT_ID"
+    name_col = col(df, getattr(df, "__colresolver__", {}), "SHIPMENT_NAME") or "SHIPMENT_NAME"
+    carrier_col = col(df, getattr(df, "__colresolver__", {}), "CARRIER_NAME") or "CARRIER_NAME"
+
+    if id_col in df.columns:
+        res = df.loc[df[id_col].astype(str).str.strip() == ship_id, carrier_col] if carrier_col in df.columns else pd.Series([])
         if not res.empty:
             return res
 
-    if "SHIPMENT_NAME" in df.columns:
+    if name_col in df.columns:
         alt = f"SH-{ship_id}"
-        res = df.loc[df["SHIPMENT_NAME"].astype(str).str.strip().str.upper() == alt, "CARRIER_NAME"]
+        res = df.loc[df[name_col].astype(str).str.strip().str.upper() == alt, carrier_col] if carrier_col in df.columns else pd.Series([])
         if not res.empty:
             return res
     return None
@@ -103,16 +113,20 @@ def direct_lookup(message: str, df: pd.DataFrame):
         return None
     sid = m.group(1)
 
-    if "SHIPMENT_ID" in df.columns:
-        hit = df.loc[df["SHIPMENT_ID"].astype(str).str.strip() == sid]
-        if not hit.empty and "CARRIER_NAME" in hit:
-            return hit["CARRIER_NAME"].iloc[0]
+    id_col = col(df, getattr(df, "__colresolver__", {}), "SHIPMENT_ID") or "SHIPMENT_ID"
+    name_col = col(df, getattr(df, "__colresolver__", {}), "SHIPMENT_NAME") or "SHIPMENT_NAME"
+    carrier_col = col(df, getattr(df, "__colresolver__", {}), "CARRIER_NAME") or "CARRIER_NAME"
 
-    if "SHIPMENT_NAME" in df.columns:
+    if id_col in df.columns:
+        hit = df.loc[df[id_col].astype(str).str.strip() == sid]
+        if not hit.empty and carrier_col in hit:
+            return hit[carrier_col].iloc[0]
+
+    if name_col in df.columns:
         alt = f"SH-{sid}"
-        hit = df.loc[df["SHIPMENT_NAME"].astype(str).str.upper().str.strip() == alt]
-        if not hit.empty and "CARRIER_NAME" in hit:
-            return hit["CARRIER_NAME"].iloc[0]
+        hit = df.loc[df[name_col].astype(str).str.upper().str.strip() == alt]
+        if not hit.empty and carrier_col in hit:
+            return hit[carrier_col].iloc[0]
     return None
 
 def quick_router(msg: str, df: pd.DataFrame):
@@ -123,6 +137,7 @@ def quick_router(msg: str, df: pd.DataFrame):
     - ¿Cuánto revenue dejó el cliente/shipper X en <mes>?
     """
     text = (msg or "").strip()
+    R = getattr(df, "__colresolver__", {}) or {}
 
     # 1) Shipment ID → carrier
     m = re.search(r"(?:shipment\s*id|shipment\s*|sh-?)\s*[:#]?\s*(\d{3,})", text, re.I)
@@ -134,25 +149,26 @@ def quick_router(msg: str, df: pd.DataFrame):
 
     # 2) En tránsito
     if re.search(r"\ben tránsito\b|\bin transit\b", text, re.I):
-        status_col_candidates = ["STATUS", "SHIPMENT_STATUS", "CURRENT_STATUS"]
-        st_col = next((c for c in status_col_candidates if c in df.columns), None)
-        if st_col:
-            hits = df[df[st_col].astype(str).str.contains("TRANSIT", case=False, na=False)]
-            cols = [c for c in ["SHIPMENT_ID", "SHIPMENT_NAME", "CARRIER_NAME"] if c in df.columns]
+        status_col = col(df, R, "SHIPMENT_STATUS") or col(df, R, "CURRENT_STATUS") or "SHIPMENT_STATUS"
+        if status_col in df.columns:
+            hits = df[df[status_col].astype(str).str.contains("TRANSIT", case=False, na=False)]
+            cols = [
+                x for x in [
+                    col(df, R, "SHIPMENT_ID") or "SHIPMENT_ID",
+                    col(df, R, "SHIPMENT_NAME") or "SHIPMENT_NAME",
+                    col(df, R, "CARRIER_NAME") or "CARRIER_NAME",
+                ] if x in df.columns
+            ]
             if not cols:
                 cols = df.columns[:3].tolist()
             rows = []
             for r in hits[cols].head(20).to_dict(orient="records"):
-                parts = []
-                for k in cols:
-                    if k in r:
-                        parts.append(str(r[k]))
-                rows.append(" · ".join(parts))
+                rows.append(" · ".join([str(r.get(k, "")) for k in cols]))
             return format_answer("in_transit", {"total": int(len(hits)), "rows": rows})
 
     # 3) Revenue por cliente + mes
-    m2 = re.search(r"revenue.*?(cliente|shipper)\s+([A-Za-z0-9 .,&\-]+?)\s+en\s+([a-záéíóú]+)", text, re.I)
-    if m2 and {"TOTAL_REVENUE", "CREATED_AT_MX"}.issubset(set(df.columns)):
+    m2 = re.search(r"revenue.*?(cliente|shipper|customer|company)\s+([A-Za-z0-9 .,&\-]+?)\s+en\s+([a-záéíóú]+)", text, re.I)
+    if m2:
         entity_name = m2.group(2).strip()
         mes_txt = m2.group(3).strip().lower()
         month_map = {
@@ -160,16 +176,16 @@ def quick_router(msg: str, df: pd.DataFrame):
             "julio":7,"agosto":8,"septiembre":9,"setiembre":9,"octubre":10,"noviembre":11,"diciembre":12
         }
         mm = month_map.get(mes_txt)
-        shipper_col_candidates = ["SHIPPER_NAME", "CUSTOMER_NAME", "CLIENTE"]
-        shipper_col = next((c for c in shipper_col_candidates if c in df.columns), None)
+        shipper_col = col(df, R, "COMPANY_NAME") or col(df, R, "SHIPPER_NAME") or col(df, R, "CUSTOMER_NAME")
+        created_col = col(df, R, "CREATED_AT_MX") or "CREATED_AT_MX"
+        revenue_col = col(df, R, "TOTAL_REVENUE") or "TOTAL_REVENUE"
 
-        if mm and shipper_col:
-            df["CREATED_AT_MX"] = pd.to_datetime(df["CREATED_AT_MX"], errors="coerce")
-            mask = (
-                df[shipper_col].astype(str).str.contains(entity_name, case=False, na=False) &
-                (df["CREATED_AT_MX"].dt.month == mm)
-            )
-            total = pd.to_numeric(df["TOTAL_REVENUE"], errors="coerce")[mask].sum()
+        if shipper_col and revenue_col in df.columns:
+            mask = df[shipper_col].astype(str).str.contains(entity_name, case=False, na=False)
+            if mm and created_col in df.columns:
+                df[created_col] = pd.to_datetime(df[created_col], errors="coerce")
+                mask = mask & (df[created_col].dt.month == mm)
+            total = pd.to_numeric(df[revenue_col], errors="coerce")[mask].sum()
             return format_answer("revenue_lookup", {"entity": entity_name, "period": mes_txt, "value": float(total)})
 
     return None
@@ -211,6 +227,7 @@ async def answer_with_nlu(text: str, df: pd.DataFrame) -> str:
         intent_obj = {"intent": "generic", "entity": None, "entity_kind": "none", "month": None, "year": None, "metric": "none", "top_n": None}
 
     intent = (intent_obj or {}).get("intent", "generic")
+    R = getattr(df, "__colresolver__", {}) or {}
 
     # 2) Ejecutar pandas según intención
     try:
@@ -218,72 +235,87 @@ async def answer_with_nlu(text: str, df: pd.DataFrame) -> str:
             sid = _shipment_id_from_text_or_intent(text, intent_obj)
             if not sid:
                 return "Necesito que me digas el shipment id 😉 (ejemplo: 63357)."
-            carrier = direct_lookup(text, df)  # ya usa regex en el propio texto
+            carrier = direct_lookup(text, df)  # intenta por regex en el mensaje
             if not carrier:
-                # intenta con SHIPMENT_ID directo
-                if "SHIPMENT_ID" in df.columns:
-                    hit = df.loc[df["SHIPMENT_ID"].astype(str).str.strip() == str(sid)]
-                    carrier = hit["CARRIER_NAME"].iloc[0] if not hit.empty and "CARRIER_NAME" in hit else None
+                id_col = col(df, R, "SHIPMENT_ID") or "SHIPMENT_ID"
+                carrier_col = col(df, R, "CARRIER_NAME") or "CARRIER_NAME"
+                if id_col in df.columns and carrier_col in df.columns:
+                    hit = df.loc[df[id_col].astype(str).str.strip() == str(sid)]
+                    carrier = hit[carrier_col].iloc[0] if not hit.empty else None
             return format_answer("shipment_lookup", {"shipment_id": sid, "carrier": carrier})
 
         if intent == "pickup_date":
             sid = _shipment_id_from_text_or_intent(text, intent_obj)
             if not sid:
                 return "Dime el shipment id y te digo la fecha de pickup 😎."
-            # columnas candidatas
-            pickup_cols = ["PICKUP_STARTS_AT", "PICKUP_AT_ORIGIN_", "PICKUP_DATE", "SCHEDULED_PICKUP_AT_ORIGIN_"]
-            pcol = _first_existing(df, pickup_cols)
+            pickup_col = (col(df, R, "PICKUP_STARTS_AT")
+                          or col(df, R, "PICKUP_AT_ORIGIN_")
+                          or col(df, R, "PICKUP_DATE")
+                          or col(df, R, "SCHEDULED_PICKUP_AT_ORIGIN_"))
+            id_col = col(df, R, "SHIPMENT_ID") or "SHIPMENT_ID"
             date_val = None
-            if pcol:
-                hit = df.loc[df["SHIPMENT_ID"].astype(str).str.strip() == str(sid), pcol] if "SHIPMENT_ID" in df.columns else pd.Series([])
+            if pickup_col and id_col in df.columns:
+                hit = df.loc[df[id_col].astype(str).str.strip() == str(sid), pickup_col]
                 if not hit.empty:
                     date_val = pd.to_datetime(hit.iloc[0], errors="coerce")
                     date_val = date_val.strftime("%Y-%m-%d %H:%M") if pd.notnull(date_val) else None
             return format_answer("pickup_date", {"shipment_id": sid, "date": date_val})
 
         if intent == "in_transit":
-            status_col = _first_existing(df, ["STATUS", "SHIPMENT_STATUS", "CURRENT_STATUS"])
-            cols = [c for c in ["SHIPMENT_ID", "SHIPMENT_NAME", "CARRIER_NAME"] if c in df.columns]
-            if not status_col:
+            status_col = (col(df, R, "SHIPMENT_STATUS")
+                          or col(df, R, "CURRENT_STATUS")
+                          or "SHIPMENT_STATUS")
+            cols = [x for x in [
+                col(df, R, "SHIPMENT_ID") or "SHIPMENT_ID",
+                col(df, R, "SHIPMENT_NAME") or "SHIPMENT_NAME",
+                col(df, R, "CARRIER_NAME") or "CARRIER_NAME",
+            ] if x in df.columns]
+            if status_col not in df.columns:
                 return "No encuentro una columna de estatus para identificar 'en tránsito'."
             hits = df[df[status_col].astype(str).str.contains("TRANSIT", case=False, na=False)]
-            rows = []
             if not cols:
                 cols = df.columns[:3].tolist()
+            rows = []
             for r in hits[cols].head(20).to_dict(orient="records"):
-                parts = []
-                for k in cols:
-                    if k in r:
-                        parts.append(str(r[k]))
-                rows.append(" · ".join(parts))
+                rows.append(" · ".join([str(r.get(k, "")) for k in cols]))
             return format_answer("in_transit", {"total": int(len(hits)), "rows": rows})
 
         if intent == "revenue_lookup":
-            shipper_col = _first_existing(df, ["SHIPPER_NAME", "CUSTOMER_NAME", "CLIENTE"])
-            if not shipper_col or "TOTAL_REVENUE" not in df.columns:
-                return "No encuentro columnas de revenue por cliente 😅, revisa que exista TOTAL_REVENUE o SHIPPER_NAME."
+            shipper_col = (col(df, R, "COMPANY_NAME")
+                           or col(df, R, "SHIPPER_NAME")
+                           or col(df, R, "CUSTOMER_NAME"))
+            revenue_col = col(df, R, "TOTAL_REVENUE") or "TOTAL_REVENUE"
+            created_col = col(df, R, "CREATED_AT_MX") or "CREATED_AT_MX"
+            if not shipper_col or revenue_col not in df.columns:
+                return "No encuentro columnas de revenue por cliente 😅, revisa que exista TOTAL_REVENUE o COMPANY_NAME."
             ent = (intent_obj or {}).get("entity")
             mes_txt = (intent_obj or {}).get("month")
             mm = MONTHS_ES.get((mes_txt or "").lower()) if mes_txt else None
-            if "CREATED_AT_MX" in df.columns:
-                df["CREATED_AT_MX"] = pd.to_datetime(df["CREATED_AT_MX"], errors="coerce")
+            if created_col in df.columns:
+                df[created_col] = pd.to_datetime(df[created_col], errors="coerce")
             mask = df[shipper_col].astype(str).str.contains(ent or "", case=False, na=False)
-            if mm and "CREATED_AT_MX" in df.columns:
-                mask = mask & (df["CREATED_AT_MX"].dt.month == mm)
-            total = pd.to_numeric(df["TOTAL_REVENUE"], errors="coerce")[mask].sum()
+            if mm and created_col in df.columns:
+                mask = mask & (df[created_col].dt.month == mm)
+            total = pd.to_numeric(df[revenue_col], errors="coerce")[mask].sum()
             return format_answer("revenue_lookup", {"entity": ent or "ese cliente", "period": mes_txt or "el periodo indicado", "value": float(total)})
 
         if intent == "carrier_stats":
-            if not carrier_col or not ent:
+            carrier_col = col(df, R, "CARRIER_NAME") or "CARRIER_NAME"
+            ent = (intent_obj or {}).get("entity")
+            if not ent or carrier_col not in df.columns:
                 return "Necesito el nombre del carrier para darte sus stats 🚛."
             subset = df[df[carrier_col].astype(str).str.contains(ent, case=False, na=False)]
             n_ship = len(subset)
-            total_rev = float(pd.to_numeric(subset.get("TOTAL_REVENUE", pd.Series(dtype=float)), errors="coerce").sum()) if "TOTAL_REVENUE" in subset else 0.0
-            gp = 0.0
-            if "GROSS_PROFIT" in subset:
-                gp = float(pd.to_numeric(subset["GROSS_PROFIT"], errors="coerce").sum())
-            elif "TOTAL_REVENUE" in subset and "TOTAL_COST" in subset:
-                gp = float(pd.to_numeric(subset["TOTAL_REVENUE"], errors="coerce").sum() - pd.to_numeric(subset["TOTAL_COST"], errors="coerce").sum())
+            revenue_col = col(df, R, "TOTAL_REVENUE")
+            cost_col = col(df, R, "TOTAL_COST")
+            gp_col = col(df, R, "GROSS_PROFIT")
+            total_rev = float(pd.to_numeric(subset.get(revenue_col, pd.Series(dtype=float)), errors="coerce").sum()) if revenue_col else 0.0
+            if gp_col and gp_col in subset:
+                gp = float(pd.to_numeric(subset[gp_col], errors="coerce").sum())
+            elif revenue_col and cost_col and revenue_col in subset and cost_col in subset:
+                gp = float(pd.to_numeric(subset[revenue_col], errors="coerce").sum() - pd.to_numeric(subset[cost_col], errors="coerce").sum())
+            else:
+                gp = 0.0
             stats_txt = f"shipments: {n_ship}, revenue: ${total_rev:,.2f}, GP: ${gp:,.2f}"
             return format_answer("carrier_stats", {"carrier": ent, "stats": stats_txt})
 
@@ -315,7 +347,7 @@ async def ask_gsheet(q: str):
     df = get_df()
     fast = quick_router(q, df)
     if fast is not None:
-        return format_reply_from_result(fast) if not isinstance(fast, str) else fast
+        return fast  # quick_router ya devuelve texto humano con format_answer
     return await answer_with_nlu(q, df)
 
 @app.post("/whatsapp", summary="Whatsapp Webhook")
@@ -331,7 +363,7 @@ async def whatsapp_webhook(request: Request):
         # A) Router rápido
         fast = quick_router(message_body, df)
         if fast is not None:
-            return twiml_response(fast)   # 👈 ya no usamos format_reply_from_result
+            return twiml_response(fast)   # quick_router ya devuelve texto bonito
 
         # B) NLU
         try:
@@ -353,6 +385,7 @@ async def whatsapp_webhook(request: Request):
         print("webhook error:", e)
 
     return twiml_response(reply)
+
 
 
 
