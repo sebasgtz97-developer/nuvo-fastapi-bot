@@ -130,7 +130,7 @@ def quick_router(msg: str, df: pd.DataFrame):
         sid = m.group(1)
         direct = direct_lookup(text, df)
         if direct:
-            return f"📄 Carrier name: {direct}"
+            return format_answer("shipment_lookup", {"shipment_id": sid, "carrier": direct})
 
     # 2) En tránsito
     if re.search(r"\ben tránsito\b|\bin transit\b", text, re.I):
@@ -141,9 +141,16 @@ def quick_router(msg: str, df: pd.DataFrame):
             cols = [c for c in ["SHIPMENT_ID", "SHIPMENT_NAME", "CARRIER_NAME"] if c in df.columns]
             if not cols:
                 cols = df.columns[:3].tolist()
-            return hits[cols].head(20)
+            rows = []
+            for r in hits[cols].head(20).to_dict(orient="records"):
+                parts = []
+                for k in cols:
+                    if k in r:
+                        parts.append(str(r[k]))
+                rows.append(" · ".join(parts))
+            return format_answer("in_transit", {"total": int(len(hits)), "rows": rows})
 
-    # 3) Revenue por cliente + mes (pattern clásico)
+    # 3) Revenue por cliente + mes
     m2 = re.search(r"revenue.*?(cliente|shipper)\s+([A-Za-z0-9 .,&\-]+?)\s+en\s+([a-záéíóú]+)", text, re.I)
     if m2 and {"TOTAL_REVENUE", "CREATED_AT_MX"}.issubset(set(df.columns)):
         entity_name = m2.group(2).strip()
@@ -163,7 +170,7 @@ def quick_router(msg: str, df: pd.DataFrame):
                 (df["CREATED_AT_MX"].dt.month == mm)
             )
             total = pd.to_numeric(df["TOTAL_REVENUE"], errors="coerce")[mask].sum()
-            return f"💵 Revenue de {entity_name} en {mes_txt}: ${total:,.2f}"
+            return format_answer("revenue_lookup", {"entity": entity_name, "period": mes_txt, "value": float(total)})
 
     return None
 
@@ -210,7 +217,7 @@ async def answer_with_nlu(text: str, df: pd.DataFrame) -> str:
         if intent == "shipment_lookup":
             sid = _shipment_id_from_text_or_intent(text, intent_obj)
             if not sid:
-                return "Necesito el shipment id (por ejemplo: 63357)."
+                return "Necesito que me digas el shipment id 😉 (ejemplo: 63357)."
             carrier = direct_lookup(text, df)  # ya usa regex en el propio texto
             if not carrier:
                 # intenta con SHIPMENT_ID directo
@@ -222,7 +229,7 @@ async def answer_with_nlu(text: str, df: pd.DataFrame) -> str:
         if intent == "pickup_date":
             sid = _shipment_id_from_text_or_intent(text, intent_obj)
             if not sid:
-                return "Necesito el shipment id para el pickup date."
+                return "Dime el shipment id y te digo la fecha de pickup 😎."
             # columnas candidatas
             pickup_cols = ["PICKUP_STARTS_AT", "PICKUP_AT_ORIGIN_", "PICKUP_DATE", "SCHEDULED_PICKUP_AT_ORIGIN_"]
             pcol = _first_existing(df, pickup_cols)
@@ -254,7 +261,7 @@ async def answer_with_nlu(text: str, df: pd.DataFrame) -> str:
         if intent == "revenue_lookup":
             shipper_col = _first_existing(df, ["SHIPPER_NAME", "CUSTOMER_NAME", "CLIENTE"])
             if not shipper_col or "TOTAL_REVENUE" not in df.columns:
-                return "No encuentro columnas para calcular revenue por cliente."
+                return "No encuentro columnas de revenue por cliente 😅, revisa que exista TOTAL_REVENUE o SHIPPER_NAME."
             ent = (intent_obj or {}).get("entity")
             mes_txt = (intent_obj or {}).get("month")
             mm = MONTHS_ES.get((mes_txt or "").lower()) if mes_txt else None
@@ -267,10 +274,8 @@ async def answer_with_nlu(text: str, df: pd.DataFrame) -> str:
             return format_answer("revenue_lookup", {"entity": ent or "ese cliente", "period": mes_txt or "el periodo indicado", "value": float(total)})
 
         if intent == "carrier_stats":
-            carrier_col = _first_existing(df, ["CARRIER_NAME", "CARRIER"])
-            ent = (intent_obj or {}).get("entity")
             if not carrier_col or not ent:
-                return "Necesito el nombre del carrier para dar estadísticas."
+                return "Necesito el nombre del carrier para darte sus stats 🚛."
             subset = df[df[carrier_col].astype(str).str.contains(ent, case=False, na=False)]
             n_ship = len(subset)
             total_rev = float(pd.to_numeric(subset.get("TOTAL_REVENUE", pd.Series(dtype=float)), errors="coerce").sum()) if "TOTAL_REVENUE" in subset else 0.0
@@ -318,18 +323,17 @@ async def whatsapp_webhook(request: Request):
     form = await request.form()
     message_body = (form.get("Body") or "").strip()
 
-    # default rápido
     reply = "Recibido ✅"
 
     try:
         df = get_df()
 
-        # A) Router rápido sin LLM (instantáneo)
+        # A) Router rápido
         fast = quick_router(message_body, df)
         if fast is not None:
-            return twiml_response(format_reply_from_result(fast) if not isinstance(fast, str) else fast)
+            return twiml_response(fast)   # 👈 ya no usamos format_reply_from_result
 
-        # B) NLU + pandas + formato humano con timeout duro
+        # B) NLU
         try:
             nlu_reply = await asyncio.wait_for(answer_with_nlu(message_body, df), timeout=7.0)
             if nlu_reply:
