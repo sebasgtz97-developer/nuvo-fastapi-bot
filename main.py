@@ -8,9 +8,9 @@ from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
 from dotenv import load_dotenv
 from xml.sax.saxutils import escape
-
 from openai_agent import interpret_query
 from gsheet import load_data
+
 
 load_dotenv()  # loads env vars; DO NOT print secrets
 
@@ -33,56 +33,55 @@ def get_df():
 
 def extract_code(raw: str) -> str:
     """
-    Pull a pandas expression on df from an LLM response.
-    Tries fenced blocks, inline df[...] snippets, and fixes common glitches.
+    Devuelve una sola expresión segura sobre df/pd.
+    Rechaza código que declare variables o use nombres no permitidos.
     """
     if not raw:
         return ""
 
-    # 1) fenced code blocks
+    # 1) bloques con ```python
     blocks = re.findall(r"```(?:python)?\s*([^`]+)```", raw, flags=re.IGNORECASE)
     candidates = [b.strip() for b in blocks]
 
-    # 2) inline df[...] snippets
-    candidates += [m.strip() for m in re.findall(r"(df\s*\[[^\n]+)", raw, flags=re.IGNORECASE)]
+    # 2) df[...] o df.algo inline
+    candidates += [m.strip() for m in re.findall(r"(df\s*\.[^\n]+|df\s*\[[^\n]+)", raw, flags=re.IGNORECASE)]
 
-    # 3) any line mentioning df[
-    for line in raw.splitlines():
-        if "df[" in line:
-            candidates.append(line.strip())
+    # 3) líneas que mencionan df[
+    candidates += [ln.strip() for ln in raw.splitlines() if "df[" in ln or ln.strip().startswith("df.")]
 
+    WHITELIST_PREFIX = ("df[", "df.", "pd.")  # solo expresiones sobre df/pd
+    SAFE = []
     for c in candidates:
-        # remove chatter before df[
-        c = re.sub(r"^[^d]*?(?=df\s*\[)", "", c, flags=re.IGNORECASE)
-        # strip comments and trailing semicolons
         c = c.split("#")[0].strip().rstrip(";")
-        # quick repair: unmatched brackets
+        c = re.sub(r"^[^d]*?(?=df\s*[\[\.]|pd\.)", "", c, flags=re.IGNORECASE)
         if c.count("[") > c.count("]"):
             c += "]"
-        # if the model returned "x = <expr>", keep only the rhs
-        if "=" in c and not c.strip().startswith("df["):
-            parts = c.split("=", 1)
-            if "df[" in parts[1]:
-                c = parts[1].strip()
-        return c
+        if not c.startswith(WHITELIST_PREFIX):
+            continue
+        # No asignaciones ni estructuras de control
+        if re.search(r"\b(import|for|while|lambda|def|class)\b|=", c):
+            continue
+        SAFE.append(c)
 
-    return raw.strip()
+    return SAFE[0] if SAFE else ""
+
 
 
 def safe_eval_df_expr(code: str, df: pd.DataFrame):
-    import io
-    import contextlib
+    import io, contextlib
     from datetime import datetime
     import builtins
 
+    if not code:
+        raise RuntimeError("No se pudo interpretar la pregunta en una expresión de pandas sobre df.")
+
     try:
-        # Normalize dates if present
+        # Normalizaciones
         date_cols = ["CREATED_AT_MX", "PICKUP_STARTS_AT", "INVOICED_AT", "ACTUAL_DELIVERED_TO_DESTINATION_"]
         for col in date_cols:
             if col in df.columns:
                 df[col] = pd.to_datetime(df[col], errors="coerce")
 
-        # Normalize numeric money columns if present
         money_cols = ["GROSS_PROFIT", "TOTAL_COST", "TOTAL_REVENUE", "FREIGHT_COST", "FREIGHT_REVENUE"]
         for col in money_cols:
             if col in df.columns:
@@ -93,13 +92,17 @@ def safe_eval_df_expr(code: str, df: pd.DataFrame):
         if "\n" in code or ";" in code:
             with contextlib.redirect_stdout(io.StringIO()):
                 exec(code, {"__builtins__": builtins.__dict__}, local_vars)
-            # return last "result-like" variable
             for var_name in reversed(list(local_vars.keys())):
                 if isinstance(local_vars[var_name], (int, float, str, pd.Series, pd.DataFrame)):
                     return local_vars[var_name]
         return eval(code, {"__builtins__": builtins.__dict__}, local_vars)
+
+    except NameError as ne:
+        raise RuntimeError(f"No conozco esa variable en la expresión: {ne}. "
+                           "Intenta mencionar *cliente, carrier o shipment id* explícitamente.")
     except Exception as e:
         raise RuntimeError(f"Eval error: {e} | code={code}")
+
 
 
 def fallback_carrier_lookup(message: str, df: pd.DataFrame):
@@ -141,6 +144,60 @@ def direct_lookup(message: str, df: pd.DataFrame):
         if not hit.empty and "CARRIER_NAME" in hit:
             return hit["CARRIER_NAME"].iloc[0]
     return None
+
+def quick_router(msg: str, df: pd.DataFrame):
+    """
+    Resuelve rápido y sin LLM:
+    - ¿Quién cubrió el shipment id 12345?
+    - ¿Cuáles son los shipment id en tránsito?
+    - ¿Cuánto revenue dejó el cliente/shipper X en <mes>?
+    """
+    text = (msg or "").strip()
+
+    # 1) Shipment ID → carrier
+    m = re.search(r"(?:shipment\s*id|shipment\s*|sh-?)\s*[:#]?\s*(\d{3,})", text, re.I)
+    if m:
+        sid = m.group(1)
+        direct = direct_lookup(text, df)
+        if direct:
+            return f"📄 Carrier name: {direct}"
+
+    # 2) En tránsito
+    if re.search(r"\ben tránsito\b|\bin transit\b", text, re.I):
+        status_col_candidates = ["STATUS", "SHIPMENT_STATUS", "CURRENT_STATUS"]
+        st_col = next((c for c in status_col_candidates if c in df.columns), None)
+        if st_col:
+            hits = df[df[st_col].astype(str).str.contains("TRANSIT", case=False, na=False)]
+            cols = [c for c in ["SHIPMENT_ID", "SHIPMENT_NAME", "CARRIER_NAME"] if c in df.columns]
+            if not cols:
+                cols = df.columns[:3].tolist()
+            return hits[cols].head(20)
+
+    # 3) Revenue por cliente + mes
+    m2 = re.search(r"revenue.*?(cliente|shipper)\s+([A-Za-z0-9 .,&\-]+?)\s+en\s+([a-záéíóú]+)", text, re.I)
+    if m2 and {"TOTAL_REVENUE", "CREATED_AT_MX"}.issubset(set(df.columns)):
+        entity_name = m2.group(2).strip()
+        mes_txt = m2.group(3).strip().lower()
+        month_map = {
+            "enero":1,"febrero":2,"marzo":3,"abril":4,"mayo":5,"junio":6,
+            "julio":7,"agosto":8,"septiembre":9,"setiembre":9,"octubre":10,"noviembre":11,"diciembre":12
+        }
+        mm = month_map.get(mes_txt)
+        # nombre del campo de cliente/shipper (ajusta si usas otro)
+        shipper_col_candidates = ["SHIPPER_NAME", "CUSTOMER_NAME", "CLIENTE"]
+        shipper_col = next((c for c in shipper_col_candidates if c in df.columns), None)
+
+        if mm and shipper_col:
+            df["CREATED_AT_MX"] = pd.to_datetime(df["CREATED_AT_MX"], errors="coerce")
+            mask = (
+                df[shipper_col].astype(str).str.contains(entity_name, case=False, na=False) &
+                (df["CREATED_AT_MX"].dt.month == mm)
+            )
+            total = pd.to_numeric(df["TOTAL_REVENUE"], errors="coerce")[mask].sum()
+            return f"💵 Revenue de {entity_name} en {mes_txt}: ${total:,.2f}"
+
+    return None
+
 
 
 def format_reply_from_result(result):
@@ -218,29 +275,21 @@ def ask_gsheet(q: str):
 
 @app.post("/whatsapp", summary="Whatsapp Webhook")
 async def whatsapp_webhook(request: Request):
-    # Twilio sends x-www-form-urlencoded; requires python-multipart in requirements
     form = await request.form()
     message_body = (form.get("Body") or "").strip()
 
-    # Always have something quick to send back
+    # default rápido
     reply = "Recibido ✅"
 
     try:
-        df = get_df()  # cached; first call may still be a few seconds
+        df = get_df()
 
-        # 1) Fast deterministic lookup (cheap)
-        direct = direct_lookup(message_body, df)
-        if direct:
-            reply = f"📄 Carrier name: {direct}"
-            return twiml_response(reply)
+        # A) Router rápido sin LLM
+        fast = quick_router(message_body, df)
+        if fast is not None:
+            return twiml_response(format_reply_from_result(fast) if not isinstance(fast, str) else fast)
 
-        # 2) Cheap heuristic fallback (also fast)
-        alt = fallback_carrier_lookup(message_body, df)
-        if alt is not None and not isinstance(alt, pd.Series) or (isinstance(alt, pd.Series) and not alt.empty):
-            reply = (format_reply_from_result(alt) or "").strip() or reply
-            return twiml_response(reply)
-
-        # 3) LLM route with a hard timeout budget
+        # B) Si no resolvió, intentar LLM con timeout duro
         async def llm_flow():
             raw_code = await run_in_threadpool(interpret_query, message_body, df)
             code = extract_code(raw_code)
@@ -249,13 +298,19 @@ async def whatsapp_webhook(request: Request):
             return (format_reply_from_result(result) or "").strip()
 
         try:
-            # keep it under Twilio’s ~10s window; leave buffer for network
             llm_reply = await asyncio.wait_for(llm_flow(), timeout=7.0)
             if llm_reply:
                 reply = llm_reply
         except asyncio.TimeoutError:
-            # Too slow—fall back to a helpful, immediate answer
-            reply = "Estoy consultando datos y puede tardar. Intenta con: “Quién cubrió el shipment id 63357?” o envía exacto el ID (por ejemplo: SH-63357)."
+            reply = (
+                "Estoy consultando datos y puede tardar.\n"
+                "Ejemplos:\n"
+                "• ¿Quién cubrió el shipment id 63357?\n"
+                "• Total revenue de *Porcelana Corona* en *julio*.\n"
+                "• Shipments *en tránsito* hoy."
+            )
+        except Exception as e:
+            reply = f"No pude entender la consulta: {e}"
 
     except Exception as e:
         print("webhook error:", e)
