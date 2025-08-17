@@ -8,9 +8,11 @@ from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
 from dotenv import load_dotenv
 from xml.sax.saxutils import escape
-from openai_agent import interpret_query
-from gsheet import load_data
 
+# ⬇️ Nuevo: importamos NLU + formateo humano
+from openai_agent import interpret_intent, format_answer
+
+from gsheet import load_data
 
 load_dotenv()  # loads env vars; DO NOT print secrets
 
@@ -29,82 +31,51 @@ def get_df():
     _SHEET_CACHE["ts"] = now
     return df
 
-# ---------- Helpers ----------
+# ---------- Helpers de respuesta ----------
 
-def extract_code(raw: str) -> str:
-    """
-    Devuelve una sola expresión segura sobre df/pd.
-    Rechaza código que declare variables o use nombres no permitidos.
-    """
-    if not raw:
-        return ""
+def format_reply_from_result(result):
+    def is_money_column(col_name):
+        keywords = ["COST", "REVENUE", "PROFIT", "RATE", "PRICE"]
+        return any(k in col_name.upper() for k in keywords)
 
-    # 1) bloques con ```python
-    blocks = re.findall(r"```(?:python)?\s*([^`]+)```", raw, flags=re.IGNORECASE)
-    candidates = [b.strip() for b in blocks]
+    def format_money(val):
+        try:
+            num = float(val)
+            return f"${num:,.2f}"
+        except:
+            return val
 
-    # 2) df[...] o df.algo inline
-    candidates += [m.strip() for m in re.findall(r"(df\s*\.[^\n]+|df\s*\[[^\n]+)", raw, flags=re.IGNORECASE)]
+    if isinstance(result, pd.Series):
+        if result.empty:
+            return "No encontré información con ese criterio."
+        key = result.name
+        val = result.iloc[0]
+        if is_money_column(key):
+            val = format_money(val)
+        key = key.replace("_", " ").capitalize()
+        return f"📄 {key}: {val}"
 
-    # 3) líneas que mencionan df[
-    candidates += [ln.strip() for ln in raw.splitlines() if "df[" in ln or ln.strip().startswith("df.")]
+    if isinstance(result, pd.DataFrame):
+        if result.empty:
+            return "No encontré información con ese criterio."
+        lines = []
+        for row in result.to_dict(orient="records"):
+            parts = []
+            for k, v in row.items():
+                if is_money_column(k):
+                    v = format_money(v)
+                parts.append(f"{k.replace('_', ' ').capitalize()}: {v}")
+            lines.append(" • " + ", ".join(parts))
+        return "\n".join(lines)
 
-    WHITELIST_PREFIX = ("df[", "df.", "pd.")  # solo expresiones sobre df/pd
-    SAFE = []
-    for c in candidates:
-        c = c.split("#")[0].strip().rstrip(";")
-        c = re.sub(r"^[^d]*?(?=df\s*[\[\.]|pd\.)", "", c, flags=re.IGNORECASE)
-        if c.count("[") > c.count("]"):
-            c += "]"
-        if not c.startswith(WHITELIST_PREFIX):
-            continue
-        # No asignaciones ni estructuras de control
-        if re.search(r"\b(import|for|while|lambda|def|class)\b|=", c):
-            continue
-        SAFE.append(c)
+    return str(result)
 
-    return SAFE[0] if SAFE else ""
+def twiml_response(body_text: str) -> PlainTextResponse:
+    safe_text = escape(body_text or "")
+    xml = f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{safe_text}</Message></Response>'
+    return PlainTextResponse(content=xml, media_type="application/xml; charset=utf-8")
 
-
-
-def safe_eval_df_expr(code: str, df: pd.DataFrame):
-    import io, contextlib
-    from datetime import datetime
-    import builtins
-
-    if not code:
-        raise RuntimeError("No se pudo interpretar la pregunta en una expresión de pandas sobre df.")
-
-    try:
-        # Normalizaciones
-        date_cols = ["CREATED_AT_MX", "PICKUP_STARTS_AT", "INVOICED_AT", "ACTUAL_DELIVERED_TO_DESTINATION_"]
-        for col in date_cols:
-            if col in df.columns:
-                df[col] = pd.to_datetime(df[col], errors="coerce")
-
-        money_cols = ["GROSS_PROFIT", "TOTAL_COST", "TOTAL_REVENUE", "FREIGHT_COST", "FREIGHT_REVENUE"]
-        for col in money_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        local_vars = {"df": df, "pd": pd, "datetime": datetime}
-
-        if "\n" in code or ";" in code:
-            with contextlib.redirect_stdout(io.StringIO()):
-                exec(code, {"__builtins__": builtins.__dict__}, local_vars)
-            for var_name in reversed(list(local_vars.keys())):
-                if isinstance(local_vars[var_name], (int, float, str, pd.Series, pd.DataFrame)):
-                    return local_vars[var_name]
-        return eval(code, {"__builtins__": builtins.__dict__}, local_vars)
-
-    except NameError as ne:
-        raise RuntimeError(f"No conozco esa variable en la expresión: {ne}. "
-                           "Intenta mencionar *cliente, carrier o shipment id* explícitamente.")
-    except Exception as e:
-        raise RuntimeError(f"Eval error: {e} | code={code}")
-
-
-
+# ---------- Lookups existentes ----------
 def fallback_carrier_lookup(message: str, df: pd.DataFrame):
     match = re.search(r"(SH-)?(\d{3,})", (message or "").upper())
     if not match:
@@ -122,7 +93,6 @@ def fallback_carrier_lookup(message: str, df: pd.DataFrame):
         if not res.empty:
             return res
     return None
-
 
 # Deterministic mini-QL for "shipment id 12345"
 SHIP_ID_RE = re.compile(r"(?:shipment\s*id|shipment\s*|sh-?)\s*[:#]?\s*(\d{3,})", re.I)
@@ -173,7 +143,7 @@ def quick_router(msg: str, df: pd.DataFrame):
                 cols = df.columns[:3].tolist()
             return hits[cols].head(20)
 
-    # 3) Revenue por cliente + mes
+    # 3) Revenue por cliente + mes (pattern clásico)
     m2 = re.search(r"revenue.*?(cliente|shipper)\s+([A-Za-z0-9 .,&\-]+?)\s+en\s+([a-záéíóú]+)", text, re.I)
     if m2 and {"TOTAL_REVENUE", "CREATED_AT_MX"}.issubset(set(df.columns)):
         entity_name = m2.group(2).strip()
@@ -183,7 +153,6 @@ def quick_router(msg: str, df: pd.DataFrame):
             "julio":7,"agosto":8,"septiembre":9,"setiembre":9,"octubre":10,"noviembre":11,"diciembre":12
         }
         mm = month_map.get(mes_txt)
-        # nombre del campo de cliente/shipper (ajusta si usas otro)
         shipper_col_candidates = ["SHIPPER_NAME", "CUSTOMER_NAME", "CLIENTE"]
         shipper_col = next((c for c in shipper_col_candidates if c in df.columns), None)
 
@@ -198,51 +167,126 @@ def quick_router(msg: str, df: pd.DataFrame):
 
     return None
 
+# ---------- NLU helpers (pandas ejecutor por intención) ----------
 
+MONTHS_ES = {
+    "enero":1,"febrero":2,"marzo":3,"abril":4,"mayo":5,"junio":6,
+    "julio":7,"agosto":8,"septiembre":9,"setiembre":9,"octubre":10,"noviembre":11,"diciembre":12
+}
 
-def format_reply_from_result(result):
-    def is_money_column(col_name):
-        keywords = ["COST", "REVENUE", "PROFIT", "RATE", "PRICE"]
-        return any(k in col_name.upper() for k in keywords)
+def _first_existing(df: pd.DataFrame, candidates):
+    return next((c for c in candidates if c in df.columns), None)
 
-    def format_money(val):
-        try:
-            num = float(val)
-            return f"${num:,.2f}"
-        except:
-            return val
+def _shipment_id_from_text_or_intent(text: str, intent_obj):
+    # del intent
+    ent = (intent_obj or {}).get("entity")
+    if ent and re.search(r"\d{3,}", ent):
+        m = re.search(r"(\d{3,})", ent)
+        if m:
+            return m.group(1)
+    # del texto
+    m2 = SHIP_ID_RE.search(text or "")
+    return m2.group(1) if m2 else None
 
-    if isinstance(result, pd.Series):
-        if result.empty:
-            return "No encontré información con ese criterio."
-        key = result.name
-        val = result.iloc[0]
-        if is_money_column(key):
-            val = format_money(val)
-        key = key.replace("_", " ").capitalize()
-        return f"📄 {key}: {val}"
+async def answer_with_nlu(text: str, df: pd.DataFrame) -> str:
+    """
+    Usa interpret_intent (LLM ligero) y ejecuta pandas seguro según intención,
+    luego formatea con format_answer.
+    """
+    # 1) NLU (con timeout para Twilio)
+    try:
+        intent_obj = await asyncio.wait_for(run_in_threadpool(interpret_intent, text, df), timeout=5.0)
+    except asyncio.TimeoutError:
+        return ("Estoy procesando tu solicitud. "
+                "Prueba: “¿Quién cubrió el shipment id 63357?” o "
+                "“Revenue de Porcelana Corona en julio”.")
+    except Exception:
+        intent_obj = {"intent": "generic", "entity": None, "entity_kind": "none", "month": None, "year": None, "metric": "none", "top_n": None}
 
-    if isinstance(result, pd.DataFrame):
-        if result.empty:
-            return "No encontré información con ese criterio."
-        lines = []
-        for row in result.to_dict(orient="records"):
-            parts = []
-            for k, v in row.items():
-                if is_money_column(k):
-                    v = format_money(v)
-                parts.append(f"{k.replace('_', ' ').capitalize()}: {v}")
-            lines.append(" • " + ", ".join(parts))
-        return "\n".join(lines)
+    intent = (intent_obj or {}).get("intent", "generic")
 
-    return str(result)
+    # 2) Ejecutar pandas según intención
+    try:
+        if intent == "shipment_lookup":
+            sid = _shipment_id_from_text_or_intent(text, intent_obj)
+            if not sid:
+                return "Necesito el shipment id (por ejemplo: 63357)."
+            carrier = direct_lookup(text, df)  # ya usa regex en el propio texto
+            if not carrier:
+                # intenta con SHIPMENT_ID directo
+                if "SHIPMENT_ID" in df.columns:
+                    hit = df.loc[df["SHIPMENT_ID"].astype(str).str.strip() == str(sid)]
+                    carrier = hit["CARRIER_NAME"].iloc[0] if not hit.empty and "CARRIER_NAME" in hit else None
+            return format_answer("shipment_lookup", {"shipment_id": sid, "carrier": carrier})
 
+        if intent == "pickup_date":
+            sid = _shipment_id_from_text_or_intent(text, intent_obj)
+            if not sid:
+                return "Necesito el shipment id para el pickup date."
+            # columnas candidatas
+            pickup_cols = ["PICKUP_STARTS_AT", "PICKUP_AT_ORIGIN_", "PICKUP_DATE", "SCHEDULED_PICKUP_AT_ORIGIN_"]
+            pcol = _first_existing(df, pickup_cols)
+            date_val = None
+            if pcol:
+                hit = df.loc[df["SHIPMENT_ID"].astype(str).str.strip() == str(sid), pcol] if "SHIPMENT_ID" in df.columns else pd.Series([])
+                if not hit.empty:
+                    date_val = pd.to_datetime(hit.iloc[0], errors="coerce")
+                    date_val = date_val.strftime("%Y-%m-%d %H:%M") if pd.notnull(date_val) else None
+            return format_answer("pickup_date", {"shipment_id": sid, "date": date_val})
 
-def twiml_response(body_text: str) -> PlainTextResponse:
-    safe_text = escape(body_text or "")
-    xml = f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{safe_text}</Message></Response>'
-    return PlainTextResponse(content=xml, media_type="application/xml; charset=utf-8")
+        if intent == "in_transit":
+            status_col = _first_existing(df, ["STATUS", "SHIPMENT_STATUS", "CURRENT_STATUS"])
+            cols = [c for c in ["SHIPMENT_ID", "SHIPMENT_NAME", "CARRIER_NAME"] if c in df.columns]
+            if not status_col:
+                return "No encuentro una columna de estatus para identificar 'en tránsito'."
+            hits = df[df[status_col].astype(str).str.contains("TRANSIT", case=False, na=False)]
+            rows = []
+            if not cols:
+                cols = df.columns[:3].tolist()
+            for r in hits[cols].head(20).to_dict(orient="records"):
+                parts = []
+                for k in cols:
+                    if k in r:
+                        parts.append(str(r[k]))
+                rows.append(" · ".join(parts))
+            return format_answer("in_transit", {"total": int(len(hits)), "rows": rows})
 
+        if intent == "revenue_lookup":
+            shipper_col = _first_existing(df, ["SHIPPER_NAME", "CUSTOMER_NAME", "CLIENTE"])
+            if not shipper_col or "TOTAL_REVENUE" not in df.columns:
+                return "No encuentro columnas para calcular revenue por cliente."
+            ent = (intent_obj or {}).get("entity")
+            mes_txt = (intent_obj or {}).get("month")
+            mm = MONTHS_ES.get((mes_txt or "").lower()) if mes_txt else None
+            if "CREATED_AT_MX" in df.columns:
+                df["CREATED_AT_MX"] = pd.to_datetime(df["CREATED_AT_MX"], errors="coerce")
+            mask = df[shipper_col].astype(str).str.contains(ent or "", case=False, na=False)
+            if mm and "CREATED_AT_MX" in df.columns:
+                mask = mask & (df["CREATED_AT_MX"].dt.month == mm)
+            total = pd.to_numeric(df["TOTAL_REVENUE"], errors="coerce")[mask].sum()
+            return format_answer("revenue_lookup", {"entity": ent or "ese cliente", "period": mes_txt or "el periodo indicado", "value": float(total)})
+
+        if intent == "carrier_stats":
+            carrier_col = _first_existing(df, ["CARRIER_NAME", "CARRIER"])
+            ent = (intent_obj or {}).get("entity")
+            if not carrier_col or not ent:
+                return "Necesito el nombre del carrier para dar estadísticas."
+            subset = df[df[carrier_col].astype(str).str.contains(ent, case=False, na=False)]
+            n_ship = len(subset)
+            total_rev = float(pd.to_numeric(subset.get("TOTAL_REVENUE", pd.Series(dtype=float)), errors="coerce").sum()) if "TOTAL_REVENUE" in subset else 0.0
+            gp = 0.0
+            if "GROSS_PROFIT" in subset:
+                gp = float(pd.to_numeric(subset["GROSS_PROFIT"], errors="coerce").sum())
+            elif "TOTAL_REVENUE" in subset and "TOTAL_COST" in subset:
+                gp = float(pd.to_numeric(subset["TOTAL_REVENUE"], errors="coerce").sum() - pd.to_numeric(subset["TOTAL_COST"], errors="coerce").sum())
+            stats_txt = f"shipments: {n_ship}, revenue: ${total_rev:,.2f}, GP: ${gp:,.2f}"
+            return format_answer("carrier_stats", {"carrier": ent, "stats": stats_txt})
+
+        # Fallback genérico
+        return "No estoy seguro de lo que pides. Prueba con: “¿Quién cubrió el shipment id 63357?”, “Revenue de Porcelana Corona en julio” o “¿Cuáles van en tránsito?”."
+
+    except Exception as e:
+        return f"No pude procesar la consulta: {e}"
 
 # ---------- Utility Routes ----------
 @app.get("/", summary="Root")
@@ -258,20 +302,16 @@ def healthz():
 def twilio_test():
     return twiml_response("Hola 👋 Funciona.")
 
-
 # ---------- Business Routes ----------
-@app.get("/ask", summary="Ask Gsheet")
-def ask_gsheet(q: str):
-    df = get_df()
-    try:
-        raw_code = interpret_query(q, df)
-        code = extract_code(raw_code)
-        print("🧠 Código generado (/ask):", raw_code, "=>", code)
-        result = safe_eval_df_expr(code, df)
-        return format_reply_from_result(result)
-    except Exception as e:
-        return {"error": str(e)}
 
+# Conservamos /ask como sanity check: usa el router rápido y luego NLU
+@app.get("/ask", summary="Ask Gsheet")
+async def ask_gsheet(q: str):
+    df = get_df()
+    fast = quick_router(q, df)
+    if fast is not None:
+        return format_reply_from_result(fast) if not isinstance(fast, str) else fast
+    return await answer_with_nlu(q, df)
 
 @app.post("/whatsapp", summary="Whatsapp Webhook")
 async def whatsapp_webhook(request: Request):
@@ -284,29 +324,22 @@ async def whatsapp_webhook(request: Request):
     try:
         df = get_df()
 
-        # A) Router rápido sin LLM
+        # A) Router rápido sin LLM (instantáneo)
         fast = quick_router(message_body, df)
         if fast is not None:
             return twiml_response(format_reply_from_result(fast) if not isinstance(fast, str) else fast)
 
-        # B) Si no resolvió, intentar LLM con timeout duro
-        async def llm_flow():
-            raw_code = await run_in_threadpool(interpret_query, message_body, df)
-            code = extract_code(raw_code)
-            print("🧠 Código generado (WhatsApp):", raw_code, "=>", code)
-            result = await run_in_threadpool(safe_eval_df_expr, code, df)
-            return (format_reply_from_result(result) or "").strip()
-
+        # B) NLU + pandas + formato humano con timeout duro
         try:
-            llm_reply = await asyncio.wait_for(llm_flow(), timeout=7.0)
-            if llm_reply:
-                reply = llm_reply
+            nlu_reply = await asyncio.wait_for(answer_with_nlu(message_body, df), timeout=7.0)
+            if nlu_reply:
+                reply = nlu_reply
         except asyncio.TimeoutError:
             reply = (
                 "Estoy consultando datos y puede tardar.\n"
                 "Ejemplos:\n"
                 "• ¿Quién cubrió el shipment id 63357?\n"
-                "• Total revenue de *Porcelana Corona* en *julio*.\n"
+                "• Revenue de *Porcelana Corona* en *julio*.\n"
                 "• Shipments *en tránsito* hoy."
             )
         except Exception as e:
@@ -316,6 +349,7 @@ async def whatsapp_webhook(request: Request):
         print("webhook error:", e)
 
     return twiml_response(reply)
+
 
 
 
