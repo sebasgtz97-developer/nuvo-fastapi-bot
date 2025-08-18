@@ -107,37 +107,72 @@ def fallback_carrier_lookup(message: str, df: pd.DataFrame):
 # Deterministic mini-QL for "shipment id 12345"
 SHIP_ID_RE = re.compile(r"(?:shipment\s*id|shipment\s*|sh-?)\s*[:#]?\s*(\d{3,})", re.I)
 
+def _prefer_name(df, guess: str, name_col: str, id_col: str) -> str:
+    """
+    Si el resolver nos dio un *_ID, pero existe el *_NAME, usa el *_NAME.
+    """
+    if guess and "ID" in guess.upper() and name_col in df.columns:
+        return name_col
+    if guess:
+        return guess
+    return name_col if name_col in df.columns else id_col
+
+
 def direct_lookup(message: str, df: pd.DataFrame):
     m = SHIP_ID_RE.search(message or "")
     if not m:
         return None
     sid = m.group(1)
 
-    id_col = col(df, getattr(df, "__colresolver__", {}), "SHIPMENT_ID") or "SHIPMENT_ID"
-    name_col = col(df, getattr(df, "__colresolver__", {}), "SHIPMENT_NAME") or "SHIPMENT_NAME"
-    carrier_col = col(df, getattr(df, "__colresolver__", {}), "CARRIER_NAME") or "CARRIER_NAME"
+    R = getattr(df, "__colresolver__", {}) or {}
+    id_col = col(df, R, "SHIPMENT_ID") or "SHIPMENT_ID"
+    name_col = col(df, R, "SHIPMENT_NAME") or "SHIPMENT_NAME"
+    carrier_guess = col(df, R, "CARRIER_NAME") or "CARRIER_NAME"
+    carrier_col = _prefer_name(df, carrier_guess, "CARRIER_NAME", "CARRIER_ID_")
 
-    if id_col in df.columns:
-        hit = df.loc[df[id_col].astype(str).str.strip() == sid]
-        if not hit.empty and carrier_col in hit:
-            return hit[carrier_col].iloc[0]
+    if id_col in df.columns and carrier_col in df.columns:
+        hit = df.loc[df[id_col].astype(str).str.strip() == sid, carrier_col]
+        if not hit.empty:
+            return hit.iloc[0]
 
-    if name_col in df.columns:
+    if name_col in df.columns and carrier_col in df.columns:
         alt = f"SH-{sid}"
-        hit = df.loc[df[name_col].astype(str).str.upper().str.strip() == alt]
-        if not hit.empty and carrier_col in hit:
-            return hit[carrier_col].iloc[0]
+        hit = df.loc[df[name_col].astype(str).str.upper().str.strip() == alt, carrier_col]
+        if not hit.empty:
+            return hit.iloc[0]
     return None
+
 
 def quick_router(msg: str, df: pd.DataFrame):
     """
     Resuelve rápido y sin LLM:
     - ¿Quién cubrió el shipment id 12345?
-    - ¿Cuáles son los shipment id en tránsito?
-    - ¿Cuánto revenue dejó el cliente/shipper X en <mes>?
+    - ¿Cuáles están en tránsito?
+    - Revenue del cliente X en <mes>
+    - ¿Cuál es la ruta/lane del shipment 12345?
     """
     text = (msg or "").strip()
     R = getattr(df, "__colresolver__", {}) or {}
+
+    # 0) Ruta / lane / route del shipment
+    if re.search(r"\b(ruta|lane|route)\b", text, re.I):
+        m = re.search(r"(?:shipment\s*id|shipment\s*|sh-?)\s*[:#]?\s*(\d{3,})", text, re.I)
+        if m:
+            sid = m.group(1)
+            id_col = col(df, R, "SHIPMENT_ID") or "SHIPMENT_ID"
+            lane_col = col(df, R, "CITY_TO_CITY_ROUTE")
+            if lane_col and id_col in df.columns:
+                val = df.loc[df[id_col].astype(str).str.strip() == sid, lane_col]
+                if not val.empty:
+                    return format_answer("generic", {"text": f"🧭 La ruta del shipment {sid} es *{val.iloc[0]}*."})
+            # armar con origen/destino
+            o_city = col(df, R, "ORIGIN_CITY")
+            d_city = col(df, R, "DESTINATION_CITY")
+            if id_col in df.columns and o_city in df.columns and d_city in df.columns:
+                row = df.loc[df[id_col].astype(str).str.strip() == sid, [o_city, d_city]]
+                if not row.empty:
+                    a, b = row.iloc[0].tolist()
+                    return format_answer("generic", {"text": f"🧭 La ruta del shipment {sid} es *{a} → {b}*."})
 
     # 1) Shipment ID → carrier
     m = re.search(r"(?:shipment\s*id|shipment\s*|sh-?)\s*[:#]?\s*(\d{3,})", text, re.I)
@@ -166,7 +201,7 @@ def quick_router(msg: str, df: pd.DataFrame):
                 rows.append(" · ".join([str(r.get(k, "")) for k in cols]))
             return format_answer("in_transit", {"total": int(len(hits)), "rows": rows})
 
-    # 3) Revenue por cliente + mes
+    # 3) Revenue por cliente + mes (company/shipper/customer)
     m2 = re.search(r"revenue.*?(cliente|shipper|customer|company)\s+([A-Za-z0-9 .,&\-]+?)\s+en\s+([a-záéíóú]+)", text, re.I)
     if m2:
         entity_name = m2.group(2).strip()
@@ -176,15 +211,18 @@ def quick_router(msg: str, df: pd.DataFrame):
             "julio":7,"agosto":8,"septiembre":9,"setiembre":9,"octubre":10,"noviembre":11,"diciembre":12
         }
         mm = month_map.get(mes_txt)
-        shipper_col = col(df, R, "COMPANY_NAME") or col(df, R, "SHIPPER_NAME") or col(df, R, "CUSTOMER_NAME")
-        created_col = col(df, R, "CREATED_AT_MX") or "CREATED_AT_MX"
-        revenue_col = col(df, R, "TOTAL_REVENUE") or "TOTAL_REVENUE"
 
-        if shipper_col and revenue_col in df.columns:
+        shipper_col = (col(df, R, "COMPANY_NAME") or col(df, R, "SHIPPER_NAME") or col(df, R, "CUSTOMER_NAME"))
+        revenue_col = (col(df, R, "TOTAL_REVENUE") or col(df, R, "FREIGHT_REVENUE"))
+         # 👉 ahora usamos PICKUP_DATE como referencia temporal
+        date_col = col(df, R, "PICKUP_DATE") or "PICKUP_DATE"
+
+
+        if shipper_col and revenue_col and shipper_col in df.columns and revenue_col in df.columns:
             mask = df[shipper_col].astype(str).str.contains(entity_name, case=False, na=False)
-            if mm and created_col in df.columns:
-                df[created_col] = pd.to_datetime(df[created_col], errors="coerce")
-                mask = mask & (df[created_col].dt.month == mm)
+            if mm and date_col in df.columns:
+                df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+                mask = mask & (df[date_col].dt.month == mm)
             total = pd.to_numeric(df[revenue_col], errors="coerce")[mask].sum()
             return format_answer("revenue_lookup", {"entity": entity_name, "period": mes_txt, "value": float(total)})
 
@@ -281,21 +319,22 @@ async def answer_with_nlu(text: str, df: pd.DataFrame) -> str:
             return format_answer("in_transit", {"total": int(len(hits)), "rows": rows})
 
         if intent == "revenue_lookup":
+            R = getattr(df, "__colresolver__", {}) or {}
             shipper_col = (col(df, R, "COMPANY_NAME")
                            or col(df, R, "SHIPPER_NAME")
                            or col(df, R, "CUSTOMER_NAME"))
-            revenue_col = col(df, R, "TOTAL_REVENUE") or "TOTAL_REVENUE"
-            created_col = col(df, R, "CREATED_AT_MX") or "CREATED_AT_MX"
+            revenue_col = (col(df, R, "TOTAL_REVENUE") or col(df, R, "FREIGHT_REVENUE") or "TOTAL_REVENUE")
+            date_col = (col(df, R, "INVOICED_AT") or col(df, R, "CREATED_AT_MX"))
             if not shipper_col or revenue_col not in df.columns:
-                return "No encuentro columnas de revenue por cliente 😅, revisa que exista TOTAL_REVENUE o COMPANY_NAME."
+                return "No encuentro columnas de revenue por cliente 😅, revisa que exista TOTAL_REVENUE/FREIGHT_REVENUE y COMPANY_NAME/SHIPPER_NAME."
             ent = (intent_obj or {}).get("entity")
             mes_txt = (intent_obj or {}).get("month")
             mm = MONTHS_ES.get((mes_txt or "").lower()) if mes_txt else None
-            if created_col in df.columns:
-                df[created_col] = pd.to_datetime(df[created_col], errors="coerce")
+            if date_col in df.columns:
+                df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
             mask = df[shipper_col].astype(str).str.contains(ent or "", case=False, na=False)
-            if mm and created_col in df.columns:
-                mask = mask & (df[created_col].dt.month == mm)
+            if mm and date_col in df.columns:
+                mask = mask & (df[date_col].dt.month == mm)
             total = pd.to_numeric(df[revenue_col], errors="coerce")[mask].sum()
             return format_answer("revenue_lookup", {"entity": ent or "ese cliente", "period": mes_txt or "el periodo indicado", "value": float(total)})
 
