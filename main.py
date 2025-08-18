@@ -8,12 +8,11 @@ from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
 from dotenv import load_dotenv
 from xml.sax.saxutils import escape
-
-# Resolver de columnas y NLU / formateo humano
 from openai_agent import build_column_resolver, col
 from openai_agent import interpret_intent, format_answer
-
 from gsheet import load_data
+import unicodedata
+
 
 load_dotenv()  # loads env vars; DO NOT print secrets
 
@@ -22,6 +21,49 @@ app = FastAPI(title="nuvo-fastapi-bot", version="1.0.0")
 # ---------- Simple cache for the Google Sheet ----------
 _SHEET_CACHE = {"df": None, "ts": 0.0}
 _CACHE_TTL = 300  # seconds
+
+def _strip_accents(s: str) -> str:
+    if not isinstance(s, str):
+        s = str(s)
+    s = unicodedata.normalize("NFKD", s)
+    return "".join(c for c in s if not unicodedata.combining(c))
+
+def pick_pickup_date_col(df):
+    """
+    Elige la mejor columna de 'pickup date' disponible, en este orden:
+    1) ACTUAL_PICKED_UP_FROM_ORIGIN_  (real)
+    2) PICKUP_STARTS_AT               (programado/ready)
+    3) APPOINTMENT_TIME_AT_ORIGIN_LOCAL_TIME (cita)
+    4) SCHEDULED_PICKUP_AT_ORIGIN_
+    5) PICKUP_DATE
+    """
+    R = getattr(df, "__colresolver__", {}) or {}
+    candidates = [
+        "ACTUAL_PICKED_UP_FROM_ORIGIN_",
+        "PICKUP_STARTS_AT",
+        "APPOINTMENT_TIME_AT_ORIGIN_LOCAL_TIME",
+        "SCHEDULED_PICKUP_AT_ORIGIN_",
+        "PICKUP_DATE",
+    ]
+    for key in candidates:
+        colname = (col(df, R, key) or key)
+        if colname in df.columns:
+            return colname
+    return None
+
+def in_transit_mask(df):
+    """
+    Devuelve una máscara booleana 'en tránsito' robusta:
+    - acepta IN TRANSIT, IN-TRANSIT, EN TRANSITO, EN TRÁNSITO, etc.
+    """
+    R = getattr(df, "__colresolver__", {}) or {}
+    status_col = (col(df, R, "SHIPMENT_STATUS") or col(df, R, "CURRENT_STATUS") or "SHIPMENT_STATUS")
+    if status_col not in df.columns:
+        return None, None
+    # normalizamos acentos y espacios
+    series = df[status_col].astype(str).map(_strip_accents).str.upper()
+    mask = series.str.contains(r"IN.?TRANSIT|EN.?TRANSITO", regex=True, na=False)
+    return status_col, mask
 
 def get_df():
     now = time()
@@ -118,6 +160,13 @@ def _prefer_name(df, guess: str, name_col: str, id_col: str) -> str:
     return name_col if name_col in df.columns else id_col
 
 
+def _prefer_name(df, guess: str, name_col: str, id_col: str) -> str:
+    if guess and "ID" in guess.upper() and name_col in df.columns:
+        return name_col
+    if guess:
+        return guess
+    return name_col if name_col in df.columns else id_col
+
 def direct_lookup(message: str, df: pd.DataFrame):
     m = SHIP_ID_RE.search(message or "")
     if not m:
@@ -143,12 +192,13 @@ def direct_lookup(message: str, df: pd.DataFrame):
     return None
 
 
+
 def quick_router(msg: str, df: pd.DataFrame):
     """
     Resuelve rápido y sin LLM:
     - ¿Quién cubrió el shipment id 12345?
     - ¿Cuáles están en tránsito?
-    - Revenue del cliente X en <mes>
+    - Revenue del cliente X en <mes> (bajado al pickup date)
     - ¿Cuál es la ruta/lane del shipment 12345?
     """
     text = (msg or "").strip()
@@ -161,11 +211,10 @@ def quick_router(msg: str, df: pd.DataFrame):
             sid = m.group(1)
             id_col = col(df, R, "SHIPMENT_ID") or "SHIPMENT_ID"
             lane_col = col(df, R, "CITY_TO_CITY_ROUTE")
-            if lane_col and id_col in df.columns:
+            if lane_col and id_col in df.columns and lane_col in df.columns:
                 val = df.loc[df[id_col].astype(str).str.strip() == sid, lane_col]
                 if not val.empty:
                     return format_answer("generic", {"text": f"🧭 La ruta del shipment {sid} es *{val.iloc[0]}*."})
-            # armar con origen/destino
             o_city = col(df, R, "ORIGIN_CITY")
             d_city = col(df, R, "DESTINATION_CITY")
             if id_col in df.columns and o_city in df.columns and d_city in df.columns:
@@ -182,11 +231,11 @@ def quick_router(msg: str, df: pd.DataFrame):
         if direct:
             return format_answer("shipment_lookup", {"shipment_id": sid, "carrier": direct})
 
-    # 2) En tránsito
-    if re.search(r"\ben tránsito\b|\bin transit\b", text, re.I):
-        status_col = col(df, R, "SHIPMENT_STATUS") or col(df, R, "CURRENT_STATUS") or "SHIPMENT_STATUS"
-        if status_col in df.columns:
-            hits = df[df[status_col].astype(str).str.contains("TRANSIT", case=False, na=False)]
+    # 2) En tránsito (robusto: IN-TRANSIT / EN TRÁNSITO / EN TRANSITO)
+    status_col, mask = in_transit_mask(df)
+    if re.search(r"\ben tránsito\b|\bin transit\b|\btransito\b|\btr[aá]nsito\b", text, re.I):
+        if status_col is not None:
+            hits = df[mask]
             cols = [
                 x for x in [
                     col(df, R, "SHIPMENT_ID") or "SHIPMENT_ID",
@@ -201,7 +250,7 @@ def quick_router(msg: str, df: pd.DataFrame):
                 rows.append(" · ".join([str(r.get(k, "")) for k in cols]))
             return format_answer("in_transit", {"total": int(len(hits)), "rows": rows})
 
-    # 3) Revenue por cliente + mes (company/shipper/customer)
+    # 3) Revenue por cliente + mes (bajado al PICKUP DATE)
     m2 = re.search(r"revenue.*?(cliente|shipper|customer|company)\s+([A-Za-z0-9 .,&\-]+?)\s+en\s+([a-záéíóú]+)", text, re.I)
     if m2:
         entity_name = m2.group(2).strip()
@@ -214,19 +263,18 @@ def quick_router(msg: str, df: pd.DataFrame):
 
         shipper_col = (col(df, R, "COMPANY_NAME") or col(df, R, "SHIPPER_NAME") or col(df, R, "CUSTOMER_NAME"))
         revenue_col = (col(df, R, "TOTAL_REVENUE") or col(df, R, "FREIGHT_REVENUE"))
-         # 👉 ahora usamos PICKUP_DATE como referencia temporal
-        date_col = col(df, R, "PICKUP_DATE") or "PICKUP_DATE"
-
+        date_col = pick_pickup_date_col(df)  # 👈 bajamos al pickup date
 
         if shipper_col and revenue_col and shipper_col in df.columns and revenue_col in df.columns:
-            mask = df[shipper_col].astype(str).str.contains(entity_name, case=False, na=False)
+            mask_shipper = df[shipper_col].astype(str).str.contains(entity_name, case=False, na=False)
             if mm and date_col in df.columns:
                 df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-                mask = mask & (df[date_col].dt.month == mm)
-            total = pd.to_numeric(df[revenue_col], errors="coerce")[mask].sum()
+                mask_shipper = mask_shipper & (df[date_col].dt.month == mm)
+            total = pd.to_numeric(df[revenue_col], errors="coerce")[mask_shipper].sum()
             return format_answer("revenue_lookup", {"entity": entity_name, "period": mes_txt, "value": float(total)})
 
     return None
+
 
 # ---------- NLU helpers (pandas ejecutor por intención) ----------
 
@@ -286,31 +334,22 @@ async def answer_with_nlu(text: str, df: pd.DataFrame) -> str:
             sid = _shipment_id_from_text_or_intent(text, intent_obj)
             if not sid:
                 return "Dime el shipment id y te digo la fecha de pickup 😎."
-            pickup_col = (col(df, R, "PICKUP_STARTS_AT")
-                          or col(df, R, "PICKUP_AT_ORIGIN_")
-                          or col(df, R, "PICKUP_DATE")
-                          or col(df, R, "SCHEDULED_PICKUP_AT_ORIGIN_"))
-            id_col = col(df, R, "SHIPMENT_ID") or "SHIPMENT_ID"
+            id_col = col(df, getattr(df, "__colresolver__", {}) or {}, "SHIPMENT_ID") or "SHIPMENT_ID"
+            pickup_col = pick_pickup_date_col(df)
             date_val = None
-            if pickup_col and id_col in df.columns:
+            if pickup_col and id_col in df.columns and pickup_col in df.columns:
                 hit = df.loc[df[id_col].astype(str).str.strip() == str(sid), pickup_col]
                 if not hit.empty:
                     date_val = pd.to_datetime(hit.iloc[0], errors="coerce")
                     date_val = date_val.strftime("%Y-%m-%d %H:%M") if pd.notnull(date_val) else None
             return format_answer("pickup_date", {"shipment_id": sid, "date": date_val})
 
+
         if intent == "in_transit":
-            status_col = (col(df, R, "SHIPMENT_STATUS")
-                          or col(df, R, "CURRENT_STATUS")
-                          or "SHIPMENT_STATUS")
-            cols = [x for x in [
-                col(df, R, "SHIPMENT_ID") or "SHIPMENT_ID",
-                col(df, R, "SHIPMENT_NAME") or "SHIPMENT_NAME",
-                col(df, R, "CARRIER_NAME") or "CARRIER_NAME",
-            ] if x in df.columns]
-            if status_col not in df.columns:
+            status_col, mask = in_transit_mask(df)
+            if status_col is None:
                 return "No encuentro una columna de estatus para identificar 'en tránsito'."
-            hits = df[df[status_col].astype(str).str.contains("TRANSIT", case=False, na=False)]
+            hits = df[mask]
             if not cols:
                 cols = df.columns[:3].tolist()
             rows = []
@@ -324,9 +363,9 @@ async def answer_with_nlu(text: str, df: pd.DataFrame) -> str:
                            or col(df, R, "SHIPPER_NAME")
                            or col(df, R, "CUSTOMER_NAME"))
             revenue_col = (col(df, R, "TOTAL_REVENUE") or col(df, R, "FREIGHT_REVENUE") or "TOTAL_REVENUE")
-            date_col = (col(df, R, "INVOICED_AT") or col(df, R, "CREATED_AT_MX"))
+            date_col = pick_pickup_date_col(df)  # 👈 PICKUP
             if not shipper_col or revenue_col not in df.columns:
-                return "No encuentro columnas de revenue por cliente 😅, revisa que exista TOTAL_REVENUE/FREIGHT_REVENUE y COMPANY_NAME/SHIPPER_NAME."
+                return "No encuentro columnas de revenue por cliente 😅. Revisa que exista TOTAL_REVENUE/FREIGHT_REVENUE y COMPANY_NAME/SHIPPER_NAME."
             ent = (intent_obj or {}).get("entity")
             mes_txt = (intent_obj or {}).get("month")
             mm = MONTHS_ES.get((mes_txt or "").lower()) if mes_txt else None
